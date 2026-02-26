@@ -519,6 +519,7 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
         cli_kv_overrides,
         cloud_requirements,
         feedback,
+        arg0_paths,
     )
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))
@@ -531,6 +532,7 @@ async fn run_ratatui_app(
     cli_kv_overrides: Vec<(String, toml::Value)>,
     mut cloud_requirements: CloudRequirementsLoader,
     feedback: codex_feedback::CodexFeedback,
+    arg0_paths: codex_arg0::Arg0DispatchPaths,
 ) -> color_eyre::Result<AppExitInfo> {
     color_eyre::install()?;
 
