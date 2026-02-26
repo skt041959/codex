@@ -3,11 +3,18 @@
 
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use codex_arg0::Arg0DispatchPaths;
+use codex_core::AuthManager;
+use codex_core::ThreadManager;
 use codex_core::config::Config;
+use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 
+use futures::SinkExt;
+use futures::StreamExt;
 use rmcp::model::ClientNotification;
 use rmcp::model::ClientRequest;
 use rmcp::model::JsonRpcMessage;
@@ -16,10 +23,16 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::{self};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 mod codex_tool_config;
@@ -59,6 +72,33 @@ pub async fn run_main(
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    // Parse CLI overrides once and derive the base Config eagerly so later
+    // components do not need to work with raw TOML values.
+    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("error parsing -c overrides: {e}"),
+        )
+    })?;
+    let config = Config::load_with_cli_overrides(cli_kv_overrides)
+        .await
+        .map_err(|e| {
+            std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
+        })?;
+    let config = Arc::new(config);
+
+    let auth_manager = AuthManager::shared(
+        config.codex_home.clone(),
+        false,
+        config.cli_auth_credentials_store_mode,
+    );
+    let thread_manager = Arc::new(ThreadManager::new(
+        config.codex_home.clone(),
+        auth_manager,
+        SessionSource::Mcp,
+        config.model_catalog.clone(),
+    ));
+
     // Set up channels.
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingMessage>(CHANNEL_CAPACITY);
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
@@ -86,27 +126,13 @@ pub async fn run_main(
         }
     });
 
-    // Parse CLI overrides once and derive the base Config eagerly so later
-    // components do not need to work with raw TOML values.
-    let cli_kv_overrides = cli_config_overrides.parse_overrides().map_err(|e| {
-        std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("error parsing -c overrides: {e}"),
-        )
-    })?;
-    let config = Config::load_with_cli_overrides(cli_kv_overrides)
-        .await
-        .map_err(|e| {
-            std::io::Error::new(ErrorKind::InvalidData, format!("error loading config: {e}"))
-        })?;
-
     // Task: process incoming messages.
     let processor_handle = tokio::spawn({
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
         let mut processor = MessageProcessor::new(
             outgoing_message_sender,
             arg0_paths,
-            std::sync::Arc::new(config),
+            thread_manager,
         );
         async move {
             while let Some(msg) = incoming_rx.recv().await {
@@ -149,6 +175,103 @@ pub async fn run_main(
     // hitting EOF which, once it drops `incoming_tx`, propagates shutdown to
     // the processor and then to the stdout task.
     let _ = tokio::join!(stdin_reader_handle, processor_handle, stdout_writer_handle);
+
+    Ok(())
+}
+
+pub async fn run_network_server(
+    port: u16,
+    arg0_paths: Arg0DispatchPaths,
+    thread_manager: Arc<ThreadManager>,
+) -> IoResult<()> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = TcpListener::bind(addr).await?;
+    info!("MCP network server listening on ws://{addr}");
+
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        info!("Accepted connection from {peer_addr}");
+
+        let arg0_paths = arg0_paths.clone();
+        let thread_manager = thread_manager.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, arg0_paths, thread_manager).await {
+                error!("Error handling connection from {peer_addr}: {e}");
+            }
+        });
+    }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    arg0_paths: Arg0DispatchPaths,
+    thread_manager: Arc<ThreadManager>,
+) -> IoResult<()> {
+    let ws_stream = accept_async(stream).await.map_err(|e| {
+        std::io::Error::new(
+            ErrorKind::ConnectionAborted,
+            format!("WebSocket handshake failed: {e}"),
+        )
+    })?;
+
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+    let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingMessage>(CHANNEL_CAPACITY);
+
+    let sender_handle: JoinHandle<IoResult<()>> = tokio::spawn(async move {
+        while let Some(msg) = outgoing_rx.recv().await {
+            let json_rpc_msg: OutgoingJsonRpcMessage = msg.into();
+            let json = serde_json::to_string(&json_rpc_msg).map_err(|e| {
+                std::io::Error::new(ErrorKind::InvalidData, format!("Serialization error: {e}"))
+            })?;
+            ws_sender
+                .send(TungsteniteMessage::Text(json.into()))
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(ErrorKind::ConnectionAborted, format!("Send error: {e}"))
+                })?;
+        }
+        Ok(())
+    });
+
+    let processor_handle = tokio::spawn({
+        let outgoing_sender = OutgoingMessageSender::new(outgoing_tx);
+        let mut processor =
+            MessageProcessor::new(outgoing_sender, arg0_paths, thread_manager.clone());
+        async move {
+            while let Some(msg) = incoming_rx.recv().await {
+                match msg {
+                    JsonRpcMessage::Request(r) => processor.process_request(r).await,
+                    JsonRpcMessage::Response(r) => processor.process_response(r).await,
+                    JsonRpcMessage::Notification(n) => processor.process_notification(n).await,
+                    JsonRpcMessage::Error(e) => processor.process_error(e),
+                }
+            }
+        }
+    });
+
+    while let Some(msg) = ws_receiver.next().await {
+        let msg = msg.map_err(|e| {
+            std::io::Error::new(ErrorKind::ConnectionAborted, format!("Receive error: {e}"))
+        })?;
+
+        if let TungsteniteMessage::Text(text) = msg {
+            match serde_json::from_str::<IncomingMessage>(&text) {
+                Ok(json_rpc_msg) => {
+                    if incoming_tx.send(json_rpc_msg).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => warn!("Failed to deserialize message: {e}"),
+            }
+        } else if msg.is_close() {
+            break;
+        }
+    }
+
+    let _ = sender_handle.await;
+    let _ = processor_handle.await;
 
     Ok(())
 }

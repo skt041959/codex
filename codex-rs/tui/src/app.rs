@@ -1233,6 +1233,8 @@ impl App {
         feedback: codex_feedback::CodexFeedback,
         is_first_run: bool,
         should_prompt_windows_sandbox_nux_at_startup: bool,
+        mcp_port: Option<u16>,
+        arg0_paths: codex_arg0::Arg0DispatchPaths,
     ) -> Result<AppExitInfo> {
         use tokio_stream::StreamExt;
         let (app_event_tx, mut app_event_rx) = unbounded_channel();
@@ -1248,6 +1250,22 @@ impl App {
             SessionSource::Cli,
             config.model_catalog.clone(),
         ));
+
+        if let Some(port) = mcp_port {
+            let thread_manager = thread_manager.clone();
+            tokio::spawn(async move {
+                if let Err(e) = codex_mcp_server::run_network_server(
+                    port,
+                    arg0_paths,
+                    thread_manager,
+                )
+                .await
+                {
+                    tracing::error!("Background MCP server error: {e}");
+                }
+            });
+        }
+
         let mut model = thread_manager
             .get_models_manager()
             .get_default_model(&config.model, RefreshStrategy::Offline)
