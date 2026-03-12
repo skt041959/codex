@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 
 use codex_arg0::Arg0DispatchPaths;
-use codex_core::AuthManager;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::default_client::USER_AGENT_SUFFIX;
 use codex_core::default_client::get_codex_user_agent;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
@@ -49,20 +47,9 @@ impl MessageProcessor {
     pub(crate) fn new(
         outgoing: OutgoingMessageSender,
         arg0_paths: Arg0DispatchPaths,
-        config: Arc<Config>,
+        thread_manager: Arc<ThreadManager>,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
-        let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
-            false,
-            config.cli_auth_credentials_store_mode,
-        );
-        let thread_manager = Arc::new(ThreadManager::new(
-            config.codex_home.clone(),
-            auth_manager,
-            SessionSource::Mcp,
-            config.model_catalog.clone(),
-        ));
         Self {
             outgoing,
             initialized: false,

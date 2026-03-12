@@ -110,6 +110,10 @@ pub struct Cli {
     #[arg(long = "no-alt-screen", default_value_t = false)]
     pub no_alt_screen: bool,
 
+    /// Start a background MCP server on the specified port.
+    #[arg(long = "mcp-port")]
+    pub mcp_port: Option<u16>,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }
